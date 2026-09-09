@@ -11,6 +11,7 @@ _PACKAGES = [
     "aiofiles>=23.2.1",
     "cryptography>=39.0.0",
     "psutil>=5.9.0",
+    "redis>=5.0.1",
 ]
 
 def _install_packages():
@@ -56,6 +57,11 @@ from fastapi.middleware.cors import CORSMiddleware
 import uvicorn
 import httpx
 import logging
+
+try:
+    import redis.asyncio as aioredis
+except Exception:
+    aioredis = None
 
 try:
     import psutil
@@ -131,6 +137,72 @@ DATA_FILE = DATA_DIR / "rvg_state.json"
 SECRET_FILE = DATA_DIR / ".rvg_secret"
 SAVE_LOCK = asyncio.Lock()
 
+# ── Redis (اختیاری) ─────────────────────────────────────────────────────────────
+# اگه REDIS_URL ست بشه و اتصال برقرار بشه، کل state پنل (کانفیگ‌ها، گروه‌های ساب،
+# رمز پنل، node ها و node key ها — یعنی همون چیزی که تا الان توی rvg_state.json
+# ذخیره می‌شد) به‌جای فایل محلی روی Redis نوشته/خونده میشه. این مشکل پاک‌شدن
+# دیتا روی پلتفرم‌هایی که دیسک بین دیپلوی‌ها پایدار نیست رو حل می‌کنه. اگه
+# Redis ست نشده باشه یا وصل نشه، پنل دقیقاً مثل قبل روی فایل محلی کار می‌کنه.
+REDIS_URL = os.environ.get("REDIS_URL", "").strip()
+REDIS_STATE_KEY = "rvg:state"
+redis_client = None
+REDIS_CONNECTED = False
+
+
+async def init_redis():
+    """اولین تلاش برای اتصال به Redis، موقع بالا اومدن پنل."""
+    global redis_client, REDIS_CONNECTED
+    if not REDIS_URL:
+        REDIS_CONNECTED = False
+        return
+    if aioredis is None:
+        logger.warning("REDIS_URL ست شده ولی پکیج redis نصب نیست — از فایل محلی استفاده می‌شود.")
+        REDIS_CONNECTED = False
+        return
+    try:
+        client = aioredis.from_url(
+            REDIS_URL, decode_responses=True, socket_connect_timeout=5, socket_timeout=5,
+        )
+        await client.ping()
+        redis_client = client
+        REDIS_CONNECTED = True
+        logger.info("Redis متصل شد — ذخیره‌سازی state از این به بعد روی Redis انجام می‌شود.")
+    except Exception as e:
+        redis_client = None
+        REDIS_CONNECTED = False
+        logger.warning(f"اتصال به Redis ناموفق بود ({e}) — از فایل محلی استفاده می‌شود.")
+
+
+async def redis_watchdog():
+    """هر ۱۵ ثانیه وضعیت اتصال Redis رو چک/تلاش برای وصل‌شدن دوباره می‌کنه، تا
+    وضعیت نمایش‌داده‌شده در پنل همیشه واقعی باشه (نه فقط لحظه‌ی استارت)."""
+    global redis_client, REDIS_CONNECTED
+    if not REDIS_URL or aioredis is None:
+        return
+    while True:
+        await asyncio.sleep(15)
+        try:
+            if redis_client is None:
+                redis_client = aioredis.from_url(
+                    REDIS_URL, decode_responses=True, socket_connect_timeout=5, socket_timeout=5,
+                )
+            await redis_client.ping()
+            if not REDIS_CONNECTED:
+                logger.info("اتصال به Redis دوباره برقرار شد.")
+            REDIS_CONNECTED = True
+        except Exception:
+            if REDIS_CONNECTED:
+                logger.warning("اتصال به Redis قطع شد — موقتاً از فایل محلی استفاده می‌شود.")
+            REDIS_CONNECTED = False
+
+
+async def _write_state_file(payload: str):
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp = DATA_FILE.with_suffix(".tmp")
+    async with aiofiles.open(tmp, "w", encoding="utf-8") as f:
+        await f.write(payload)
+    tmp.replace(DATA_FILE)
+
 
 def _get_or_create_secret() -> str:
     env_secret = os.environ.get("SECRET_KEY")
@@ -177,12 +249,36 @@ def apply_logging_state():
 
 async def load_state():
     global LINKS, AUTH, SUBS
+    data = None
+    loaded_from = None
     try:
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
-        if DATA_FILE.exists():
-            async with aiofiles.open(DATA_FILE, "r", encoding="utf-8") as f:
-                raw = await f.read()
-            data = json.loads(raw)
+        if REDIS_CONNECTED and redis_client:
+            try:
+                raw = await redis_client.get(REDIS_STATE_KEY)
+                if raw:
+                    data = json.loads(raw)
+                    loaded_from = "redis"
+            except Exception as e:
+                logger.warning(f"خواندن state از Redis ناموفق بود: {e}")
+
+        if data is None:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            if DATA_FILE.exists():
+                async with aiofiles.open(DATA_FILE, "r", encoding="utf-8") as f:
+                    raw = await f.read()
+                data = json.loads(raw)
+                loaded_from = "file"
+                # اولین باری که Redis وصل شده ولی هنوز چیزی داخلش نیست، دیتای
+                # فایل محلی (قبلی) رو یک‌بار به Redis منتقل می‌کنیم تا از این
+                # به بعد Redis منبع اصلی باشه.
+                if REDIS_CONNECTED and redis_client:
+                    try:
+                        await redis_client.set(REDIS_STATE_KEY, json.dumps(data, ensure_ascii=False))
+                        logger.info("state موجود روی فایل محلی، یک‌بار به Redis منتقل شد.")
+                    except Exception as e:
+                        logger.warning(f"انتقال state به Redis ناموفق بود: {e}")
+
+        if data:
             LINKS.update(data.get("links", {}))
             SUBS.update(data.get("subs", {}))
             NODE_KEYS.update(data.get("node_keys", {}))
@@ -193,7 +289,7 @@ async def load_state():
             CONFIG["disable_logging"] = bool(data.get("disable_logging", False))
             apply_logging_state()
             logger.info(
-                f"State loaded: {len(LINKS)} links, {len(SUBS)} subs, "
+                f"State loaded from {loaded_from}: {len(LINKS)} links, {len(SUBS)} subs, "
                 f"{len(NODES)} nodes, {len(NODE_KEYS)} node keys"
             )
     except Exception as e:
@@ -201,23 +297,29 @@ async def load_state():
 
 async def save_state():
     async with SAVE_LOCK:
+        data = {
+            "links": dict(LINKS),
+            "subs": dict(SUBS),
+            "node_keys": dict(NODE_KEYS),
+            "nodes": dict(NODES),
+            "password_hash": AUTH["password_hash"],
+            "disable_logging": CONFIG.get("disable_logging", False),
+            "saved_at": datetime.now().isoformat(),
+        }
+        wrote_to_redis = False
+        if REDIS_CONNECTED and redis_client:
+            try:
+                await redis_client.set(REDIS_STATE_KEY, json.dumps(data, ensure_ascii=False))
+                wrote_to_redis = True
+            except Exception as e:
+                logger.warning(f"نوشتن state روی Redis ناموفق بود: {e} — فقط روی فایل محلی ذخیره می‌شود.")
         try:
-            DATA_DIR.mkdir(parents=True, exist_ok=True)
-            data = {
-                "links": dict(LINKS),
-                "subs": dict(SUBS),
-                "node_keys": dict(NODE_KEYS),
-                "nodes": dict(NODES),
-                "password_hash": AUTH["password_hash"],
-                "disable_logging": CONFIG.get("disable_logging", False),
-                "saved_at": datetime.now().isoformat(),
-            }
-            tmp = DATA_FILE.with_suffix(".tmp")
-            async with aiofiles.open(tmp, "w", encoding="utf-8") as f:
-                await f.write(json.dumps(data, ensure_ascii=False, indent=2))
-            tmp.replace(DATA_FILE)
+            # وقتی Redis وصله هم به‌عنوان پشتیبان محلی نوشته می‌شه (هزینه‌ش
+            # ناچیزه)، ولی وقتی Redis وصل نیست، همین فایل تنها منبع دیتاست.
+            await _write_state_file(json.dumps(data, ensure_ascii=False, indent=2))
         except Exception as e:
-            logger.warning(f"Could not save state: {e}")
+            if not wrote_to_redis:
+                logger.warning(f"Could not save state: {e}")
 
 
 # ── Debounced save ─────────────────────────────────────────────────────────────
@@ -361,6 +463,9 @@ async def startup():
     http_client = httpx.AsyncClient(
         limits=limits, timeout=timeout, follow_redirects=True,
     )
+    await init_redis()
+    if REDIS_URL:
+        asyncio.create_task(redis_watchdog())
     await load_state()
     await _restart_mtproto_instances()
     log_activity("system", "سرور راه‌اندازی شد", "ok")
@@ -1276,6 +1381,9 @@ async def get_stats(_=Depends(require_auth)):
         "active_links": sum(1 for l in snap.values() if is_link_allowed(l)),
         "expired_links": sum(1 for l in snap.values() if is_link_expired(l)),
         "subs_count": len(SUBS),
+        "redis_configured": bool(REDIS_URL),
+        "redis_connected": REDIS_CONNECTED,
+        "storage_backend": "redis" if REDIS_CONNECTED else "file",
     }
 
 @app.get("/api/bot-tcp-proxy/domains")

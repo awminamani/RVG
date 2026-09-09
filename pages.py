@@ -2762,6 +2762,7 @@ a{color:inherit;text-decoration:none}
       <div class="sr"><span class="sr-k"><i class="ti ti-bolt"></i> Siz10a XHTTP Ultra</span><span class="sr-v" style="color:var(--green-t)">● فعال · 3 mode</span></div>
       <div class="sr"><span class="sr-k"><i class="ti ti-folders"></i> Sub Groups</span><span class="sr-v" style="color:var(--green-t)">● فعال v9</span></div>
       <div class="sr"><span class="sr-k"><i class="ti ti-rss"></i> Subscription API</span><span class="sr-v" style="color:var(--green-t)">● فعال</span></div>
+      <div class="sr"><span class="sr-k"><i class="ti ti-database"></i> Redis</span><span class="sr-v" id="redis-status">—</span></div>
       <div class="sr"><span class="sr-k"><i class="ti ti-clock"></i> آپتایم</span><span class="sr-v" id="uptime-inline">—</span></div>
       <div class="sr" style="flex-direction:column;align-items:flex-start;gap:4px">
         <div style="width:100%;display:flex;justify-content:space-between"><span class="sr-k"><i class="ti ti-gauge"></i> بار نسبی</span><span class="sr-v" id="bw-pct">—%</span></div>
@@ -3150,7 +3151,7 @@ a{color:inherit;text-decoration:none}
         <div class="srv-tile"><div class="srv-tile-icon"><i class="ti ti-versions"></i></div><div class="srv-tile-text"><div class="srv-tile-label">نسخه</div><div class="srv-tile-val">v9.2</div></div></div>
         <div class="srv-tile"><div class="srv-tile-icon"><i class="ti ti-brand-fastapi"></i></div><div class="srv-tile-text"><div class="srv-tile-label">فریم‌ورک</div><div class="srv-tile-val">FastAPI + Uvicorn</div></div></div>
         <div class="srv-tile"><div class="srv-tile-icon"><i class="ti ti-cloud"></i></div><div class="srv-tile-text"><div class="srv-tile-label">پلتفرم</div><div class="srv-tile-val">Railway</div></div></div>
-        <div class="srv-tile" style="grid-column:1/-1"><div class="srv-tile-icon"><i class="ti ti-device-floppy"></i></div><div class="srv-tile-text"><div class="srv-tile-label">ذخیره‌سازی</div><div class="srv-tile-val">JSON File (/data)</div></div></div>
+        <div class="srv-tile" style="grid-column:1/-1"><div class="srv-tile-icon"><i class="ti ti-device-floppy"></i></div><div class="srv-tile-text"><div class="srv-tile-label">ذخیره‌سازی</div><div class="srv-tile-val" id="storage-backend-val">JSON File (/data)</div></div></div>
       </div>
       <div class="sr" style="border:none;padding:14px 0 0;margin-top:6px;border-top:1px solid var(--bd)">
         <span class="sr-k"><i class="ti ti-bolt-off"></i> توقف کامل لاگ‌گیری (برای بیشترین سرعت ممکن)</span>
@@ -3316,6 +3317,13 @@ async function fetchStats(){
     document.getElementById('errs-badge').textContent=d.total_errors+' خطا';
     document.getElementById('uptime-inline').textContent=d.uptime;
     document.getElementById('uptime-badge').textContent='Railway · '+d.uptime;
+    const redisEl=document.getElementById('redis-status'),storageEl=document.getElementById('storage-backend-val');
+    if(redisEl){
+      if(d.redis_connected){redisEl.style.color='var(--green-t)';redisEl.textContent='● متصل';}
+      else if(d.redis_configured){redisEl.style.color='var(--red-t)';redisEl.textContent='● وصل نیست (فایل محلی جایگزین)';}
+      else{redisEl.style.color='var(--t3)';redisEl.textContent='تنظیم نشده';}
+    }
+    if(storageEl)storageEl.textContent=d.redis_connected?'Redis':'JSON File (/data)';
     document.getElementById('last-upd').textContent='آخرین بروزرسانی: '+new Date().toLocaleTimeString('fa-IR');
     document.getElementById('conns-live').innerHTML='<span class="dot dg pulse"></span> '+d.active_connections+' اتصال';
     document.getElementById('t-traffic').innerHTML=d.total_traffic_mb.toFixed(1)+'<span class="m-unit">MB</span>';
